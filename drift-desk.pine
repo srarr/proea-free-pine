@@ -1,0 +1,1180 @@
+//@version=6
+// DRIFT DESK 1.3.0 · original open-source pressure/trend interpretation · MIT
+// Shared technical candidates; independent paper and broker acceptance/outcomes.
+// Price/volume context is not order flow, probability, or proof of a trading edge.
+// Keep extra historical-tick and order-fill recalculation disabled; overrides are outside the confirmed-close model.
+indicator("Drift Desk · Open Source", "Drift Desk", overlay = true, behind_chart = false, max_boxes_count = 120, max_lines_count = 250, max_labels_count = 200, max_bars_back = 3000)
+const bool IS_STRATEGY = false
+const string DRIFT_VERSION = "1.3.0"
+
+// DRIFT DESK · original pressure / ratchet engine. No private indicator code.
+const string NY_TZ = "America/New_York"
+const string G_PRESSURE = "01 · Pressure & trail"
+const string G_GATES = "02 · Optional entry gates"
+const string G_RISK = "03 · Fixed paper plan"
+
+int pressureFastLen = input.int(8, "Pressure EMA · fast", minval = 2, maxval = 100, group = G_PRESSURE, display = display.none)
+int pressureSlowLen = input.int(21, "Pressure EMA · slow", minval = 3, maxval = 200, group = G_PRESSURE, display = display.none)
+int normalizationLen = input.int(50, "Pressure deviation window", minval = 10, maxval = 300, group = G_PRESSURE, display = display.none)
+int volumeLen = input.int(20, "Relative volume / valid-bar window", minval = 2, maxval = 200, group = G_PRESSURE, tooltip = "New entries require this many consecutive positive-volume candles. Missing or recovering volume uses neutral price-only context until the complete window is valid.", display = display.none)
+float volumeCap = input.float(3, "Relative volume cap", minval = 1, maxval = 10, step = 0.25, group = G_PRESSURE, display = display.none)
+float projection = input.float(0.5, "ATR pressure projection", minval = 0, maxval = 2, step = 0.1, group = G_PRESSURE, display = display.none)
+int atrLen = input.int(14, "ATR period", minval = 2, maxval = 100, group = G_PRESSURE, display = display.none)
+float bandMult = input.float(2, "Trail ATR multiplier", minval = 0.5, maxval = 8, step = 0.25, group = G_PRESSURE, display = display.none)
+
+bool emaGate = input.bool(false, "Require EMA alignment", group = G_GATES, display = display.none)
+int emaLen = input.int(100, "Trend EMA length", minval = 5, maxval = 500, group = G_GATES, display = display.none)
+bool efficiencyGate = input.bool(false, "Require price-path efficiency", group = G_GATES, display = display.none)
+int efficiencyLen = input.int(20, "Efficiency window", minval = 2, maxval = 200, group = G_GATES, display = display.none)
+float efficiencyMin = input.float(0.2, "Minimum efficiency · 0 to 1", minval = 0, maxval = 1, step = 0.05, group = G_GATES, active = efficiencyGate, display = display.none)
+bool mtfGate = input.bool(false, "Require eligible timeframe agreement", group = G_GATES, display = display.none)
+float mtfRequired = input.float(0.625, "Minimum same-direction fraction", minval = 0.5, maxval = 1, step = 0.025, group = G_GATES, tooltip = "Lower or unavailable frames are excluded. Neutral eligible frames stay in the denominator. This count is not a probability.", active = mtfGate, display = display.none)
+bool sessionGate = input.bool(false, "Require New York entry session", group = G_GATES, display = display.none)
+string tradeSession = input.session("0930-1600", "Entry session · New York", group = G_GATES, tooltip = "Chart-bar opening timestamp determines membership. Close-based decisions can occur at the last inside bar's end. Standard single HHmm-HHmm session.", active = sessionGate, display = display.none)
+
+float cashRisk = input.float(100, "Planned cash risk · symbol currency", minval = 1, maxval = 1000000, group = G_RISK, display = display.none)
+string qtyMode = input.string("Auto", "Quantity increment", options = ["Auto", "Manual"], group = G_RISK, tooltip = "Auto uses TradingView's symbol minimum contract quantity (fallback 1). This is feed metadata, not broker-specific acceptance or account FX conversion.", display = display.none)
+float manualQtyStep = input.float(1, "Manual quantity step", minval = 0.000001, maxval = 1000000, group = G_RISK, tooltip = "Used in Manual mode. Estimated units use symbol point value and symbol currency. Zero estimated units blocks the plan.", active = qtyMode == "Manual", display = display.none)
+float qtyStep = qtyMode == "Auto" ? (not na(syminfo.mincontract) and syminfo.mincontract > 0 ? syminfo.mincontract : 1) : manualQtyStep
+int swingLen = input.int(10, "Structure stop · prior bars", minval = 2, maxval = 200, group = G_RISK, display = display.none)
+float stopAtrBuffer = input.float(0.25, "Stop ATR buffer", minval = 0, maxval = 5, step = 0.05, group = G_RISK, display = display.none)
+float rewardR = input.float(2, "Final target · initial R", minval = 1, maxval = 10, step = 0.25, group = G_RISK, tooltip = "TP1 is an observational 1R checkpoint, with no partial exit or stop movement. The final target is the only target order.", display = display.none)
+float maxStopPct = input.float(0, "Maximum stop distance % · zero disables", minval = 0, maxval = 100, step = 0.25, group = G_RISK, display = display.none)
+int maxHoldBars = input.int(120, "Plan timeout · bars after entry", minval = 1, maxval = 5000, group = G_RISK, display = display.none)
+bool sendJsonAlerts = input.bool(true, IS_STRATEGY ? "Structured broker-submission alerts" : "Structured paper-entry alerts", group = "04 · Alerts", tooltip = "Use Any alert() function call. Indicator: accepted paper plan. Strategy: submitted broker entry with reference plan, not confirmed fill. No external order router.", display = display.none)
+
+// New v1.1 inputs follow the original 26 core inputs to preserve their indices.
+bool sensitivityGate = input.bool(false, "Require confirmed HTF EMA alignment", group = G_GATES, tooltip = "Optional original reference: compare the confirmed chart close with the EMA from the last completed higher-timeframe candle. Off preserves the original candidate rule; this is not a vendor sensitivity formula.", display = display.none)
+string sensitivityTf = input.timeframe("60", "HTF EMA reference timeframe", group = G_GATES, tooltip = "Must be strictly above the chart timeframe when enabled. Only the preceding completed source candle is used, so the reference is delayed by confirmation.", active = sensitivityGate, display = display.none)
+int sensitivityLen = input.int(21, "HTF EMA reference length", minval = 2, maxval = 500, group = G_GATES, active = sensitivityGate, display = display.none)
+
+if barstate.isfirst
+    if not chart.is_standard or na(timeframe.in_seconds())
+        runtime.error("Drift Desk requires standard time-based candles with usable volume.")
+    if pressureFastLen >= pressureSlowLen
+        runtime.error("Pressure fast EMA must be shorter than pressure slow EMA.")
+    if sessionGate and not timeframe.isintraday
+        runtime.error("The optional entry-session gate requires an intraday chart. Turn it off on daily or higher charts.")
+    if sensitivityGate and (na(timeframe.in_seconds(sensitivityTf)) or timeframe.in_seconds(sensitivityTf) <= timeframe.in_seconds())
+        runtime.error("The enabled HTF EMA reference must be strictly higher than the chart timeframe. Choose a higher reference or turn the gate off.")
+
+// Normalize represented differences before comparison; Pine rounds float operands to nine decimals.
+f_numericSign(float value) =>
+    int(nz(value / math.abs(value), 0))
+
+f_barOhlcValid(float o, float h, float l, float c) =>
+    not na(o) and not na(h) and not na(l) and not na(c) and f_numericSign(h - math.max(o, c)) >= 0 and f_numericSign(l - math.min(o, c)) <= 0
+
+f_requireBarOhlc(float o, float h, float l, float c, int closingStamp) =>
+    bool valid = f_barOhlcValid(o, h, l, c)
+    if not valid
+        runtime.error("Drift Desk paused: invalid confirmed OHLC on " + syminfo.tickerid + " at " + str.format_time(closingStamp, "yyyy-MM-dd HH:mm", "UTC") + " UTC. Open/high/low/close must exist and open/close must be inside the high-low range. Check the feed and reload; no plan outcome is inferred from this bar.")
+    valid
+
+// Fail before TA, ratchet, paper, research or broker state consumes an observed malformed bar.
+// Missing/zero volume retains its separate, recoverable valid-volume-window policy.
+if barstate.isconfirmed
+    f_requireBarOhlc(open, high, low, close, time_close)
+
+type DriftState
+    float lower = na
+    float upper = na
+    float trail = na
+    int trend = 0
+
+type Event
+    int stamp
+    string message
+    int dir
+
+var array<Event> eventTape = array.new<Event>()
+f_event(string message, int direction) =>
+    array.unshift(eventTape, Event.new(time_close, message, direction))
+    if array.size(eventTape) > 6
+        array.pop(eventTape)
+
+f_tickOut(float px, int direction, bool target) =>
+    int roundDirection = target ? direction : -direction
+    float ticks = px / syminfo.mintick
+    math.round_to_mintick((roundDirection == 1 ? math.ceil(ticks - 0.000000001) : math.floor(ticks + 0.000000001)) * syminfo.mintick)
+
+// Preserve real sub-tick feed OHLC; normalize only cancellation-level numeric noise.
+f_priceDistance(float fromPrice, float toPrice, int direction) =>
+    float rawDistance = (toPrice - fromPrice) * direction
+    float rawTicks = rawDistance / syminfo.mintick
+    float nearestTicks = math.round(rawTicks)
+    float tolerance = 8 * 2.220446049250313e-16 * math.max(1, math.max(math.abs(fromPrice), math.abs(toPrice)) / syminfo.mintick)
+    bool snapNoise = math.abs(rawTicks - nearestTicks) / tolerance <= 1
+    [snapNoise ? nearestTicks * syminfo.mintick : rawDistance, snapNoise ? nearestTicks : rawTicks]
+
+f_riskQuantity(float distance) =>
+    float qty = 0
+    if not na(distance) and distance > 0 and syminfo.pointvalue > 0
+        float unitRisk = distance * syminfo.pointvalue
+        float rawSteps = cashRisk / unitRisk / qtyStep
+        float nearestSteps = math.round(rawSteps)
+        float tolerance = 8 * 2.220446049250313e-16 * math.max(1, math.abs(rawSteps))
+        // Compare scaled errors: Pine rounds float comparison operands to 9 decimals.
+        float normalized = math.abs(rawSteps - nearestSteps) / tolerance <= 1 ? nearestSteps : rawSteps
+        float wholeSteps = math.floor(normalized)
+        qty := wholeSteps * qtyStep
+        float totalRisk = qty * unitRisk
+        float budgetTolerance = 8 * 2.220446049250313e-16 * math.max(math.abs(cashRisk), math.abs(totalRisk))
+        if (totalRisk - cashRisk) / budgetTolerance > 1
+            qty := math.max(0, wholeSteps - 1) * qtyStep
+    qty
+
+// All TA calls execute globally. Context substitutes neutral volume weight, never zero.
+float candleRange = high - low
+float closeLocation = candleRange > 0 ? math.max(-1, math.min(1, (2 * close - high - low) / candleRange)) : 0
+float bodyEfficiency = candleRange > 0 ? math.max(-1, math.min(1, (close - open) / candleRange)) : 0
+float volumeMean = ta.sma(volume, volumeLen)
+bool currentVolumePositive = not na(volume) and volume > 0
+float volumeValidCount = math.sum(currentVolumePositive ? 1.0 : 0.0, volumeLen)
+bool volumeReadyNow = currentVolumePositive and volumeValidCount == volumeLen and not na(volumeMean) and volumeMean > 0
+float relVolume = volumeReadyNow ? volume / volumeMean : na
+float volumeWeight = volumeReadyNow ? math.min(volumeCap, relVolume) : 1
+float pressure = (0.6 * closeLocation + 0.4 * bodyEfficiency) * volumeWeight
+float pressureFast = ta.ema(pressure, pressureFastLen)
+float pressureSlow = ta.ema(pressure, pressureSlowLen)
+float pressureSpread = pressureFast - pressureSlow
+float pressureDeviation = ta.stdev(pressureSpread, normalizationLen)
+float driftNow = not na(pressureDeviation) and pressureDeviation > 0 ? math.max(-3, math.min(3, pressureSpread / pressureDeviation)) : 0
+float atr = ta.atr(atrLen)
+float ema = ta.ema(close, emaLen)
+float pathTravel = math.sum(math.abs(ta.change(close)), efficiencyLen)
+float efficiency = not na(close[efficiencyLen]) and pathTravel > 0 ? math.abs(close - close[efficiencyLen]) / pathTravel : 0
+float priorSwingLow = ta.lowest(low, swingLen)[1]
+float priorSwingHigh = ta.highest(high, swingLen)[1]
+bool pressureReady = not na(close[pressureSlowLen + normalizationLen]) and not na(close[volumeLen]) and not na(pressureDeviation)
+bool commonGateReady = pressureReady and not na(close[math.max(emaLen, math.max(efficiencyLen, swingLen))])
+
+// The independent matrix proxy has fixed settings, shared by manual and research trails.
+const int mtfFastLen = 20
+const int mtfSlowLen = 50
+const int mtfSlopeLen = 3
+float contextFast = ta.ema(close, mtfFastLen)
+float contextSlow = ta.ema(close, mtfSlowLen)
+float contextAtr = ta.atr(14)
+float contextSlope = contextAtr > 0 ? (contextSlow - contextSlow[mtfSlopeLen]) / contextAtr : 0
+int contextDir = contextFast > contextSlow and contextSlope > 0 ? 1 : contextFast < contextSlow and contextSlope < 0 ? -1 : 0
+float contextStrength = contextAtr > 0 ? math.min(3, math.abs(contextFast - contextSlow) / contextAtr + math.abs(contextSlope)) : 0
+int contextReady = not na(close[mtfSlowLen + mtfSlopeLen]) and not na(contextAtr) and contextAtr > 0 ? 1 : 0
+
+// Lower rows route requests to chart resolution and discard them; no LTF sampling.
+float chartSeconds = timeframe.in_seconds()
+string requestTf1 = chartSeconds > 60 ? timeframe.period : "1"
+string requestTf5 = chartSeconds > 300 ? timeframe.period : "5"
+string requestTf15 = chartSeconds > 900 ? timeframe.period : "15"
+string requestTf30 = chartSeconds > 1800 ? timeframe.period : "30"
+string requestTf60 = chartSeconds > 3600 ? timeframe.period : "60"
+string requestTf240 = chartSeconds > 14400 ? timeframe.period : "240"
+string requestTfD = chartSeconds > 86400 ? timeframe.period : "D"
+string requestTfW = chartSeconds > 604800 ? timeframe.period : "W"
+[dir1, strength1, stamp1, ready1] = request.security(syminfo.tickerid, requestTf1, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dir5, strength5, stamp5, ready5] = request.security(syminfo.tickerid, requestTf5, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dir15, strength15, stamp15, ready15] = request.security(syminfo.tickerid, requestTf15, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dir30, strength30, stamp30, ready30] = request.security(syminfo.tickerid, requestTf30, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dir60, strength60, stamp60, ready60] = request.security(syminfo.tickerid, requestTf60, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dir240, strength240, stamp240, ready240] = request.security(syminfo.tickerid, requestTf240, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dirD, strengthD, stampD, readyD] = request.security(syminfo.tickerid, requestTfD, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+[dirW, strengthW, stampW, readyW] = request.security(syminfo.tickerid, requestTfW, [contextDir[1], contextStrength[1], time_close[1], contextReady[1]], lookahead = barmerge.lookahead_on)
+
+// One synchronized confirmed source packet. Off routes to chart context, never LTF.
+float sensitivityEmaSource = ta.ema(close, sensitivityLen)
+bool sensitivityReadySource = not na(close[sensitivityLen]) and not na(sensitivityEmaSource)
+string sensitivityRequestTf = sensitivityGate ? sensitivityTf : timeframe.period
+[sensitivityEmaRequested, sensitivityReadyRequested, sensitivityStampRequested] = request.security(syminfo.tickerid, sensitivityRequestTf, [sensitivityEmaSource[1], sensitivityReadySource[1], time_close[1]], lookahead = barmerge.lookahead_on)
+
+var array<string> mtfNames = array.from("1", "5", "15", "30", "60", "240", "D", "W")
+var array<float> mtfSeconds = array.from(60.0, 300.0, 900.0, 1800.0, 3600.0, 14400.0, 86400.0, 604800.0)
+var array<int> mtfDirs = array.new<int>(8, 0)
+var array<float> mtfStrength = array.new<float>(8, na)
+var array<float> mtfAge = array.new<float>(8, na)
+var array<bool> mtfEligible = array.new<bool>(8, false)
+var array<bool> mtfIsLocal = array.new<bool>(8, false)
+var array<string> mtfStates = array.new<string>(8, "WARMUP")
+var int mtfBull = 0
+var int mtfBear = 0
+var int mtfNeutral = 0
+var int mtfCount = 0
+var float mtfAgreement = 0
+var int mtfDirection = 0
+
+f_isExactMtf(int index) =>
+    float seconds = array.get(mtfSeconds, index)
+    index < 6 ? timeframe.isintraday and seconds == chartSeconds : index == 6 ? timeframe.isdaily and timeframe.multiplier == 1 : timeframe.isweekly and timeframe.multiplier == 1
+
+f_setMtf(int index, int requestedDir, float requestedStrength, int requestedStamp, int requestedReady) =>
+    float seconds = array.get(mtfSeconds, index)
+    bool lower = seconds < chartSeconds
+    bool equal = f_isExactMtf(index)
+    bool available = not lower and (equal ? contextReady == 1 : requestedReady == 1 and not na(requestedStamp) and requestedStamp <= time_close)
+    int direction = available ? (equal ? contextDir : requestedDir) : 0
+    array.set(mtfDirs, index, direction)
+    array.set(mtfStrength, index, available ? (equal ? contextStrength : requestedStrength) : na)
+    array.set(mtfAge, index, available ? (equal ? 0 : math.max(0, (time_close - requestedStamp) / 60000.0)) : na)
+    array.set(mtfEligible, index, available)
+    array.set(mtfIsLocal, index, equal)
+    array.set(mtfStates, index, lower ? "LOWER / N/A" : not available ? "WARMUP" : direction == 1 ? "UP" : direction == -1 ? "DOWN" : "MIXED")
+
+bool sessionNow = not na(time(timeframe.period, tradeSession, NY_TZ))
+int sessionStartHour = int(str.tonumber(str.substring(tradeSession, 0, 2)))
+int sessionStartMinute = int(str.tonumber(str.substring(tradeSession, 2, 4)))
+int sessionAnchorDay = dayofmonth(time, NY_TZ) - (hour(time, NY_TZ) * 60 + minute(time, NY_TZ) < sessionStartHour * 60 + sessionStartMinute ? 1 : 0)
+int sessionInstanceStamp = timestamp(NY_TZ, year(time, NY_TZ), month(time, NY_TZ), sessionAnchorDay, sessionStartHour, sessionStartMinute)
+bool sessionStart = sessionNow and (not sessionNow[1] or sessionInstanceStamp != sessionInstanceStamp[1])
+var bool inSession = false
+var bool ready = false
+var bool volReady = false
+var bool volumeContextOnly = true
+var bool sensitivityReady = false
+var float sensitivityReference = na
+var int sensitivityStamp = na
+var bool sensitivityLongOk = false
+var bool sensitivityShortOk = false
+var float drift = 0
+var float center = na
+var float trail = na
+var float lowerBand = na
+var float upperBand = na
+var int trend = 0
+var DriftState mainState = DriftState.new()
+
+f_projectCenter(float atrIn) =>
+    hlc3 + drift * atrIn * projection
+
+f_stepTrend(DriftState state, float projectedCenter, float atrIn, float multiplier, bool valid) =>
+    int flip = 0
+    if valid
+        float rawLower = projectedCenter - atrIn * multiplier
+        float rawUpper = projectedCenter + atrIn * multiplier
+        float previousLower = state.lower
+        float previousUpper = state.upper
+        int previousTrend = state.trend
+        state.lower := na(previousLower) ? rawLower : close[1] >= previousLower ? math.max(rawLower, previousLower) : rawLower
+        state.upper := na(previousUpper) ? rawUpper : close[1] <= previousUpper ? math.min(rawUpper, previousUpper) : rawUpper
+        if previousTrend == 0
+            state.trend := close >= projectedCenter ? 1 : -1
+        else if previousTrend == 1 and close < previousLower
+            state.trend := -1
+            flip := -1
+        else if previousTrend == -1 and close > previousUpper
+            state.trend := 1
+            flip := 1
+        state.trail := state.trend == 1 ? state.lower : state.upper
+    flip
+
+f_gateDirection(int direction) =>
+    bool emaOk = direction == 1 ? close > ema : direction == -1 ? close < ema : false
+    bool efficiencyOk = efficiency >= efficiencyMin
+    float agreement = mtfCount > 0 ? (direction == 1 ? mtfBull : mtfBear) * 1.0 / mtfCount : 0
+    bool mtfOk = mtfCount > 0 and agreement >= mtfRequired
+    bool sensitivityOk = direction == 1 ? sensitivityLongOk : direction == -1 ? sensitivityShortOk : false
+    bool allowed = direction != 0 and commonGateReady and volReady and (not emaGate or emaOk) and (not efficiencyGate or efficiencyOk) and (not mtfGate or mtfOk) and (not sessionGate or inSession) and (not sensitivityGate or sensitivityOk)
+    string reason = not commonGateReady ? "Full history warmup required" : not volReady ? "Volume missing/recovering · need " + str.tostring(volumeLen) + " positive bars" : emaGate and not emaOk ? "EMA alignment missing" : efficiencyGate and not efficiencyOk ? "Path efficiency below threshold" : mtfGate and not mtfOk ? "Eligible timeframe agreement missing" : sessionGate and not inSession ? "Outside New York entry session" : sensitivityGate and not sensitivityReady ? "Confirmed HTF EMA history unavailable" : sensitivityGate and not sensitivityOk ? "Confirmed HTF EMA alignment missing" : "Confirmed flip · volume valid" + (emaGate ? " · EMA" : "") + (efficiencyGate ? " · efficiency" : "") + (mtfGate ? " · MTF" : "") + (sessionGate ? " · session" : "") + (sensitivityGate ? " · confirmed HTF EMA" : "")
+    [allowed, reason]
+
+f_makePlan(int direction, float atrIn) =>
+    float stop = f_tickOut(direction == 1 ? priorSwingLow - atrIn * stopAtrBuffer : priorSwingHigh + atrIn * stopAtrBuffer, direction, false)
+    [risk, riskTicks] = f_priceDistance(stop, close, direction)
+    float checkpoint = f_tickOut(close + direction * risk, direction, true)
+    float target = f_tickOut(close + direction * risk * rewardR, direction, true)
+    [targetDistance, targetTicks] = f_priceDistance(close, target, direction)
+    float qty = f_riskQuantity(risk)
+    bool percentOk = maxStopPct == 0 or (math.abs(close) > 0 and risk / math.abs(close) * 100 <= maxStopPct)
+    bool valid = direction != 0 and not na(close[swingLen]) and not na(atrIn) and atrIn > 0 and not na(stop) and math.floor(riskTicks) >= 1 and math.floor(targetTicks) >= 1 and qty > 0 and percentOk
+    string reason = not percentOk ? "Stop exceeds configured percentage" : not valid ? "Invalid stop / tick distance / quantity" : "Fixed structure + ATR plan"
+    [stop, checkpoint, target, risk, qty, valid, reason]
+
+f_outcome(int direction, float entry, float stop, float checkpoint, float target, float risk, int entryBar, bool checkpointSeen) =>
+    bool closed = false
+    float exitPrice = na
+    string exitReason = ""
+    bool hitCheckpoint = checkpointSeen
+    bool ambiguous = false
+    float resultR = na
+    if bar_index > entryBar
+        bool stopGap = direction == 1 ? open <= stop : open >= stop
+        bool targetGap = direction == 1 ? open >= target : open <= target
+        bool stopTouch = direction == 1 ? low <= stop : high >= stop
+        bool targetTouch = direction == 1 ? high >= target : low <= target
+        bool checkpointTouch = direction == 1 ? high >= checkpoint : low <= checkpoint
+        bool checkpointAtOpen = direction == 1 ? open >= checkpoint : open <= checkpoint
+        // The opening print has known priority over a later stop touch.
+        hitCheckpoint := checkpointSeen or (not stopGap and checkpointAtOpen)
+        if stopGap
+            exitPrice := open
+            exitReason := "GAP STOP"
+        else if targetGap
+            exitPrice := target
+            exitReason := "FINAL TARGET"
+            hitCheckpoint := true
+        else if stopTouch
+            exitPrice := stop
+            ambiguous := targetTouch
+            exitReason := targetTouch ? "DUAL TOUCH → STOP" : "STOP"
+        else
+            hitCheckpoint := hitCheckpoint or checkpointTouch
+            if targetTouch
+                exitPrice := target
+                exitReason := "FINAL TARGET"
+            else if bar_index - entryBar >= maxHoldBars
+                exitPrice := close
+                exitReason := "TIMEOUT"
+        closed := not na(exitPrice)
+        if closed
+            resultR := (exitPrice - entry) * direction / risk
+    [closed, exitPrice, exitReason, hitCheckpoint, ambiguous, resultR]
+
+var bool planActive = false
+var int planDir = 0
+var float planEntry = na
+var float planStop = na
+var float planTP1 = na
+var float planTarget = na
+var float planRisk = na
+var float planQty = na
+var int planEntryBar = na
+var int planEntryTime = na
+var bool planTP1Seen = false
+var string planReason = "No accepted plan"
+var float planExit = na
+var string planExitReason = "No resolved plan"
+var float planLastR = na
+var int paperTrades = 0
+var int paperWins = 0
+var int paperLosses = 0
+var float paperNetR = 0
+var int paperAmbiguous = 0
+var int paperCheckpoints = 0
+var string blockedReason = "Wait for full history"
+var int lastFlipBar = na
+var int lastFlipTime = na
+bool rawLong = false
+bool rawShort = false
+bool candidateLong = false
+bool candidateShort = false
+int candidateDir = 0
+float candidateEntry = na
+float candidateStop = na
+float candidateTP1 = na
+float candidateTarget = na
+float candidateRisk = na
+float candidateQty = na
+string candidateReason = ""
+bool signalLong = false
+bool signalShort = false
+bool planClosed = false
+bool planTP1Pulse = false
+
+if barstate.isconfirmed
+    ready := commonGateReady and not na(atr) and atr > 0
+    volReady := volumeReadyNow
+    volumeContextOnly := not volReady
+    inSession := sessionNow
+    sensitivityReady := sensitivityGate and sensitivityReadyRequested and not na(sensitivityEmaRequested) and not na(sensitivityStampRequested) and sensitivityStampRequested <= time_close
+    sensitivityReference := sensitivityReady ? sensitivityEmaRequested : na
+    sensitivityStamp := sensitivityReady ? sensitivityStampRequested : na
+    sensitivityLongOk := sensitivityReady and close > sensitivityReference
+    sensitivityShortOk := sensitivityReady and close < sensitivityReference
+    drift := driftNow
+    center := f_projectCenter(atr)
+    f_setMtf(0, dir1, strength1, stamp1, ready1)
+    f_setMtf(1, dir5, strength5, stamp5, ready5)
+    f_setMtf(2, dir15, strength15, stamp15, ready15)
+    f_setMtf(3, dir30, strength30, stamp30, ready30)
+    f_setMtf(4, dir60, strength60, stamp60, ready60)
+    f_setMtf(5, dir240, strength240, stamp240, ready240)
+    f_setMtf(6, dirD, strengthD, stampD, readyD)
+    f_setMtf(7, dirW, strengthW, stampW, readyW)
+    mtfBull := 0
+    mtfBear := 0
+    mtfNeutral := 0
+    mtfCount := 0
+    for i = 0 to 7
+        if array.get(mtfEligible, i)
+            mtfCount += 1
+            int side = array.get(mtfDirs, i)
+            mtfBull += side == 1 ? 1 : 0
+            mtfBear += side == -1 ? 1 : 0
+            mtfNeutral += side == 0 ? 1 : 0
+    mtfAgreement := mtfCount > 0 ? math.max(mtfBull, mtfBear) * 1.0 / mtfCount : 0
+    mtfDirection := mtfCount > 0 and mtfBull > mtfBear and mtfBull * 1.0 / mtfCount >= mtfRequired ? 1 : mtfCount > 0 and mtfBear > mtfBull and mtfBear * 1.0 / mtfCount >= mtfRequired ? -1 : 0
+    int flip = f_stepTrend(mainState, center, atr, bandMult, pressureReady and not na(atr) and atr > 0)
+    trend := mainState.trend
+    trail := mainState.trail
+    lowerBand := mainState.lower
+    upperBand := mainState.upper
+    rawLong := flip == 1
+    rawShort := flip == -1
+    if flip != 0
+        lastFlipBar := bar_index
+        lastFlipTime := time_close
+    if ready and not volReady and volumeReadyNow[1]
+        f_event("Volume gap · recovery window required", 0)
+
+    if planActive
+        [closed, exitPrice, exitReason, checkpointHit, ambiguous, resultR] = f_outcome(planDir, planEntry, planStop, planTP1, planTarget, planRisk, planEntryBar, planTP1Seen)
+        if checkpointHit and not planTP1Seen
+            planTP1Seen := true
+            planTP1Pulse := true
+            paperCheckpoints += 1
+            f_event("1R observed · no order change", planDir)
+        if closed
+            planActive := false
+            planClosed := true
+            planExit := exitPrice
+            planExitReason := exitReason
+            planLastR := resultR
+            paperTrades += 1
+            paperWins += resultR > 0 ? 1 : 0
+            paperLosses += resultR < 0 ? 1 : 0
+            paperNetR += resultR
+            paperAmbiguous += ambiguous ? 1 : 0
+            f_event(exitReason + " · " + str.tostring(resultR, "0.##") + "R", planDir)
+
+    if flip != 0
+        [gatesOk, gateReason] = f_gateDirection(flip)
+        [stop, checkpoint, target, risk, qty, riskOk, riskReason] = f_makePlan(flip, atr)
+        blockedReason := not gatesOk ? gateReason : not riskOk ? riskReason : planActive ? "Valid flip · paper plan already active" : planClosed ? "Valid flip · no replacement on exit bar" : "Accepted paper plan"
+        if gatesOk and riskOk
+            candidateDir := flip
+            candidateLong := flip == 1
+            candidateShort := flip == -1
+            candidateEntry := close
+            candidateStop := stop
+            candidateTP1 := checkpoint
+            candidateTarget := target
+            candidateRisk := risk
+            candidateQty := qty
+            candidateReason := gateReason + " · " + riskReason
+            if not planActive and not planClosed
+                planActive := true
+                planDir := flip
+                planEntry := candidateEntry
+                planStop := candidateStop
+                planTP1 := candidateTP1
+                planTarget := candidateTarget
+                planRisk := candidateRisk
+                planQty := candidateQty
+                planEntryBar := bar_index
+                planEntryTime := time_close
+                planTP1Seen := false
+                planReason := candidateReason
+                signalLong := flip == 1
+                signalShort := flip == -1
+                f_event((flip == 1 ? "LONG" : "SHORT") + " paper · " + str.tostring(close, format.mintick), flip)
+        if not signalLong and not signalShort
+            f_event((flip == 1 ? "UP FLIP" : "DOWN FLIP") + " · " + blockedReason, flip)
+
+string deskState = not ready ? "WARMUP" : planActive ? (planDir == 1 ? "LONG" : "SHORT") : not volReady ? "VOLUME WAIT" : trend == 1 ? "UP TREND" : "DOWN TREND"
+string deskReason = not ready ? "Collecting complete pressure / structure history" : planActive ? "Fixed plan active · checkpoint is observational" : not volReady ? "Volume missing/recovering · need " + str.tostring(volumeLen) + " consecutive positive bars" : "Wait for the next confirmed trail flip"
+
+f_jsonNumber(float value) =>
+    string result = "null"
+    if not na(value)
+        if f_numericSign(value) == 0
+            result := "0"
+        else
+            int exponent = int(math.floor(math.log10(math.abs(value))))
+            result := exponent < -6 or exponent > 12 ? str.tostring(value / math.pow(10, exponent), "0.################") + "e" + str.tostring(exponent) : str.tostring(value, "0.################")
+    result
+f_jsonPrice(float value) =>
+    na(value) ? "null" : str.tostring(value, format.mintick)
+f_jsonEntry(float value) =>
+    f_jsonNumber(value)
+f_jsonString(string value) =>
+    "\"" + str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\"") + "\""
+
+// Indicator-only dialog conditions; strategies use broker submission alert() below.
+alertcondition(not IS_STRATEGY and signalLong, "Drift Desk · Long paper plan", "Confirmed long paper plan on {{ticker}} {{interval}}")
+alertcondition(not IS_STRATEGY and signalShort, "Drift Desk · Short paper plan", "Confirmed short paper plan on {{ticker}} {{interval}}")
+alertcondition(not IS_STRATEGY and (rawLong or rawShort), "Drift Desk · Trail flip", "Confirmed trail direction changed on {{ticker}} {{interval}}; gates may block entry")
+alertcondition(not IS_STRATEGY and planTP1Pulse, "Drift Desk · 1R observed", "Paper 1R checkpoint observed; no partial exit or stop adjustment")
+alertcondition(not IS_STRATEGY and planClosed, "Drift Desk · Paper resolved", "Paper plan resolved; the paper record excludes costs")
+if barstate.isconfirmed and not IS_STRATEGY and sendJsonAlerts and (signalLong or signalShort)
+    string id = syminfo.tickerid + "|" + timeframe.period + "|" + str.tostring(time_close) + "|" + str.tostring(planDir)
+    string payload = "{\"schema\":\"drift-desk.v1\",\"event\":\"paper_entry\",\"id\":" + f_jsonString(id) + ",\"symbol\":" + f_jsonString(syminfo.tickerid) + ",\"timeframe\":" + f_jsonString(timeframe.period) + ",\"bar_close_ms\":" + str.tostring(time_close) + ",\"direction\":" + str.tostring(planDir) + ",\"entry\":" + f_jsonEntry(planEntry) + ",\"stop\":" + f_jsonPrice(planStop) + ",\"checkpoint\":" + f_jsonPrice(planTP1) + ",\"target\":" + f_jsonPrice(planTarget) + ",\"quantity_estimate\":" + f_jsonNumber(planQty) + ",\"symbol_currency\":" + f_jsonString(syminfo.currency)
+    payload += ",\"drift\":" + f_jsonNumber(drift) + ",\"relative_volume\":" + f_jsonNumber(relVolume) + ",\"mtf_up\":" + str.tostring(mtfBull) + ",\"mtf_down\":" + str.tostring(mtfBear) + ",\"mtf_eligible\":" + str.tostring(mtfCount) + ",\"reason\":" + f_jsonString(planReason) + ",\"checkpoint_observational\":true,\"confirmed\":true,\"costs_included\":false}"
+    alert(payload, alert.freq_once_per_bar_close)
+
+// RESEARCH ONLY · fixed grid, train-only selection, no live parameter adoption.
+const string G_LAB = "05 · Fixed-window research · opt in"
+bool inResearch = input.bool(false, "Enable 12-candidate research lab", group = G_LAB, tooltip = "Runs only on available chart history. It never changes manual settings. Reinspection is not a fresh holdout. Costs below are a standardized R drag, separate from broker properties.", display = display.none)
+int labTrainStart = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Training start · UTC", group = G_LAB, display = display.none, active = inResearch)
+int labSplit = input.time(timestamp("01 Jun 2026 00:00 +0000"), "Train / validation split · UTC", group = G_LAB, tooltip = "Flatten and freeze at the first observed confirmed close at or beyond this time. No validation entry on that settlement bar.", display = display.none, active = inResearch)
+int labValidationEnd = input.time(timestamp("01 Sep 2026 00:00 +0000"), "Validation end · UTC", group = G_LAB, display = display.none, active = inResearch)
+int labMinTrades = input.int(20, "Minimum training trades for selection", minval = 1, maxval = 1000, group = G_LAB, tooltip = "A sample filter, not evidence of statistical significance. Incomplete training history prevents selection even if this minimum is met.", display = display.none, active = inResearch)
+float labCommission = input.float(0.04, "Lab commission % · each side", minval = 0, maxval = 10, step = 0.01, group = G_LAB, display = display.none, active = inResearch)
+int labSlippage = input.int(1, "Lab adverse tick cost · each side", minval = 0, maxval = 10000, group = G_LAB, tooltip = "Subtracts two-sided tick cost after the outcome, including target exits. Does not shift hit paths or model actual fills.", display = display.none, active = inResearch)
+
+// Unconditional TA calls preserve each requested ATR's exact historical series.
+float labAtr10 = ta.atr(10)
+float labAtr14 = ta.atr(14)
+float labAtr21 = ta.atr(21)
+bool labEnabled = inResearch
+bool labDatesValid = labTrainStart < labSplit and labSplit < labValidationEnd
+
+type LabBook
+    bool active = false
+    int direction = 0
+    float entry = na
+    float stop = na
+    float checkpoint = na
+    float target = na
+    float risk = na
+    int entryBar = na
+    bool checkpointSeen = false
+    int trades = 0
+    int wins = 0
+    float netR = 0
+    float peakR = 0
+    float drawdownR = 0
+    int ambiguous = 0
+    int boundaryExits = 0
+
+f_labNet(float grossR, float entry, float exitPrice, float risk) =>
+    float priceCost = 2 * labSlippage * syminfo.mintick + labCommission / 100 * (math.abs(entry) + math.abs(exitPrice))
+    grossR - priceCost / risk
+
+f_labResolve(LabBook book, float exitPrice, float grossR, bool ambiguous, bool boundary) =>
+    float result = f_labNet(grossR, book.entry, exitPrice, book.risk)
+    book.active := false
+    book.trades += 1
+    book.wins += result > 0 ? 1 : 0
+    book.netR += result
+    book.peakR := math.max(book.peakR, book.netR)
+    book.drawdownR := math.max(book.drawdownR, book.peakR - book.netR)
+    book.ambiguous += ambiguous ? 1 : 0
+    book.boundaryExits += boundary ? 1 : 0
+    result
+
+// The shared normal outcome has priority. A boundary only closes a survivor.
+f_labStepBook(LabBook book, bool forceBoundary) =>
+    bool resolved = false
+    if book.active
+        [closed, exitPrice, exitReason, checkpointSeen, ambiguous, grossR] = f_outcome(book.direction, book.entry, book.stop, book.checkpoint, book.target, book.risk, book.entryBar, book.checkpointSeen)
+        book.checkpointSeen := checkpointSeen
+        if closed
+            f_labResolve(book, exitPrice, grossR, ambiguous, false)
+            resolved := true
+        else if forceBoundary
+            float boundaryR = (close - book.entry) * book.direction / book.risk
+            f_labResolve(book, close, boundaryR, false, true)
+            resolved := true
+    resolved
+
+f_labEnter(LabBook book, int direction, float entry, float stop, float checkpoint, float target, float risk) =>
+    book.active := true
+    book.direction := direction
+    book.entry := entry
+    book.stop := stop
+    book.checkpoint := checkpoint
+    book.target := target
+    book.risk := risk
+    book.entryBar := bar_index
+    book.checkpointSeen := false
+    true
+
+f_labTryCandidate(LabBook book, int direction, float candidateAtr) =>
+    bool accepted = false
+    if direction != 0 and not book.active
+        [gatesOk, gateReason] = f_gateDirection(direction)
+        [stop, checkpoint, target, risk, quantity, riskOk, riskReason] = f_makePlan(direction, candidateAtr)
+        if gatesOk and riskOk
+            accepted := f_labEnter(book, direction, close, stop, checkpoint, target, risk)
+    accepted
+
+var array<int> labAtrLens = array.from(10, 10, 10, 10, 14, 14, 14, 14, 21, 21, 21, 21)
+var array<float> labMultipliers = array.from(1.5, 2.0, 2.5, 3.0, 1.5, 2.0, 2.5, 3.0, 1.5, 2.0, 2.5, 3.0)
+var array<DriftState> labTrendStates = array.new<DriftState>()
+var array<LabBook> labTrainBooks = array.new<LabBook>()
+var array<LabBook> labValBooks = array.new<LabBook>()
+var array<int> labFlips = array.new<int>(12, 0)
+
+// Stable renderer exports. Validation indices: 0 frozen leader, 1 manual baseline.
+var array<int> labTrainTrades = array.new<int>(12, 0)
+var array<int> labTrainWins = array.new<int>(12, 0)
+var array<float> labTrainNetR = array.new<float>(12, 0)
+var array<float> labTrainMeanR = array.new<float>(12, na)
+var array<float> labTrainDD = array.new<float>(12, 0)
+var array<int> labTrainAmbiguous = array.new<int>(12, 0)
+var array<int> labTrainBoundaryExits = array.new<int>(12, 0)
+var array<bool> labTrainActive = array.new<bool>(12, false)
+var array<int> labValTrades = array.new<int>(2, 0)
+var array<int> labValWins = array.new<int>(2, 0)
+var array<float> labValNetR = array.new<float>(2, 0)
+var array<float> labValMeanR = array.new<float>(2, na)
+var array<float> labValDD = array.new<float>(2, 0)
+var array<int> labValAmbiguous = array.new<int>(2, 0)
+var array<int> labValBoundaryExits = array.new<int>(2, 0)
+var array<bool> labValActive = array.new<bool>(2, false)
+var int labFirstLoadedTime = time
+var int labFirstReadyTime = na
+var int labFirstValidationTime = na
+var int labLastObservedTime = na
+var int labFreezeTime = na
+var int labEndTime = na
+var int labWinner = -1
+var int labPhase = 0
+var bool labFrozen = false
+var bool labTrainSeen = false
+var bool labValidationSeen = false
+var bool labTrainCovered = false
+var bool labValidationCovered = false
+var string labStatus = not inResearch ? "OFF" : not labDatesValid ? "INVALID DATES" : "WAITING"
+
+if barstate.isfirst
+    for i = 0 to 11
+        array.push(labTrendStates, DriftState.new())
+        array.push(labTrainBooks, LabBook.new())
+    array.push(labValBooks, LabBook.new())
+    array.push(labValBooks, LabBook.new())
+
+f_labAtr(int length) => length == 10 ? labAtr10 : length == 14 ? labAtr14 : labAtr21
+
+// Ranking reads TRAINING books only, after every boundary settlement has finished.
+// Pine float comparisons use platform precision; exact platform ties retain lower ID.
+f_labSelect(array<LabBook> books, int minimumTrades, bool covered) =>
+    int selected = -1
+    float bestMean = na
+    float bestDrawdown = na
+    if covered
+        for i = 0 to 11
+            LabBook book = array.get(books, i)
+            if book.trades >= minimumTrades
+                float mean = book.netR / book.trades
+                if selected == -1 or mean > bestMean or (mean == bestMean and book.drawdownR < bestDrawdown)
+                    selected := i
+                    bestMean := mean
+                    bestDrawdown := book.drawdownR
+    selected
+
+f_labExport(array<LabBook> books, array<int> trades, array<int> wins, array<float> net, array<float> mean, array<float> drawdown, array<int> ambiguous, array<int> boundaryExits, array<bool> active) =>
+    for i = 0 to array.size(books) - 1
+        LabBook book = array.get(books, i)
+        array.set(trades, i, book.trades)
+        array.set(wins, i, book.wins)
+        array.set(net, i, book.netR)
+        array.set(mean, i, book.trades > 0 ? book.netR / book.trades : na)
+        array.set(drawdown, i, book.drawdownR)
+        array.set(ambiguous, i, book.ambiguous)
+        array.set(boundaryExits, i, book.boundaryExits)
+        array.set(active, i, book.active)
+    true
+
+if barstate.isconfirmed and labEnabled and labDatesValid
+    labLastObservedTime := time_close
+    // Keep every candidate's exact ratchet continuously prewarmed across all phases.
+    for i = 0 to 11
+        float candidateAtr = f_labAtr(array.get(labAtrLens, i))
+        DriftState state = array.get(labTrendStates, i)
+        int flip = f_stepTrend(state, f_projectCenter(candidateAtr), candidateAtr, array.get(labMultipliers, i), pressureReady and not na(candidateAtr) and candidateAtr > 0)
+        array.set(labFlips, i, flip)
+    bool allWarm = commonGateReady and (not sensitivityGate or sensitivityReady) and not na(labAtr10) and labAtr10 > 0 and not na(labAtr14) and labAtr14 > 0 and not na(labAtr21) and labAtr21 > 0
+    if allWarm and na(labFirstReadyTime)
+        labFirstReadyTime := time_close
+
+    if not labFrozen and time_close >= labTrainStart and time_close < labSplit
+        labPhase := 1
+        labTrainSeen := true
+        labTrainCovered := labFirstLoadedTime < labTrainStart and not na(labFirstReadyTime) and labFirstReadyTime < labTrainStart
+        for i = 0 to 11
+            LabBook book = array.get(labTrainBooks, i)
+            bool resolved = f_labStepBook(book, false)
+            if not book.active and not resolved
+                f_labTryCandidate(book, array.get(labFlips, i), f_labAtr(array.get(labAtrLens, i)))
+    else if not labFrozen and time_close >= labSplit
+        for i = 0 to 11
+            f_labStepBook(array.get(labTrainBooks, i), true)
+        labTrainCovered := labTrainSeen and labFirstLoadedTime < labTrainStart and not na(labFirstReadyTime) and labFirstReadyTime < labTrainStart
+        labWinner := f_labSelect(labTrainBooks, labMinTrades, labTrainCovered)
+        labFrozen := true
+        labFreezeTime := time_close
+        labPhase := time_close >= labValidationEnd ? 3 : 2
+        if labPhase == 3
+            labEndTime := time_close
+    else if labFrozen and labPhase == 2
+        if time_close >= labValidationEnd
+            for i = 0 to 1
+                f_labStepBook(array.get(labValBooks, i), true)
+            labEndTime := time_close
+            labPhase := 3
+            labValidationCovered := labTrainCovered and labValidationSeen and labFreezeTime < labValidationEnd
+        else
+            labValidationSeen := true
+            if na(labFirstValidationTime)
+                labFirstValidationTime := time_close
+            LabBook leader = array.get(labValBooks, 0)
+            bool leaderResolved = f_labStepBook(leader, false)
+            if labWinner >= 0 and not leader.active and not leaderResolved
+                f_labTryCandidate(leader, array.get(labFlips, labWinner), f_labAtr(array.get(labAtrLens, labWinner)))
+            LabBook baseline = array.get(labValBooks, 1)
+            bool baselineResolved = f_labStepBook(baseline, false)
+            // Technical eligibility is independent of the core paper ledger's occupancy.
+            if candidateDir != 0 and not baseline.active and not baselineResolved
+                f_labEnter(baseline, candidateDir, candidateEntry, candidateStop, candidateTP1, candidateTarget, candidateRisk)
+
+    f_labExport(labTrainBooks, labTrainTrades, labTrainWins, labTrainNetR, labTrainMeanR, labTrainDD, labTrainAmbiguous, labTrainBoundaryExits, labTrainActive)
+    f_labExport(labValBooks, labValTrades, labValWins, labValNetR, labValMeanR, labValDD, labValAmbiguous, labValBoundaryExits, labValActive)
+    labStatus := labPhase == 0 ? "WAITING" : not labTrainCovered ? "INCOMPLETE HISTORY" : labPhase == 1 ? "TRAINING" : labWinner < 0 ? "NO ELIGIBLE TRAIN LEADER" : labPhase == 2 ? "VALIDATING" : not labValidationCovered ? "INCOMPLETE VALIDATION" : "COMPLETE / RESEARCH ONLY"
+
+// DISPLAY ONLY · Pine Chart Studio / Dashboard Studio / Narrative
+// All display inputs are excluded from technical gates and order calculations.
+string vGroup = "Display · make it yours"
+string vTheme = input.string("Accessible", "Theme", options = ["Accessible", "Aurora", "Royal Gold"], group = vGroup, display = display.none)
+string vView = input.string(IS_STRATEGY ? "Minimal" : "Full", "Chart view", options = ["Full", "Focus", "Minimal"], group = vGroup, display = display.none)
+string vDesk = input.string(IS_STRATEGY ? "Off" : "Full", "Desk", options = ["Full", "Compact", "Off"], group = vGroup, display = display.none)
+string vDeskPos = input.string("Top Left", "Desk position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = vGroup, display = display.none, active = vDesk != "Off")
+string vSize = input.string("Medium", "Desk, lab & tag size", options = ["Small", "Medium", "Large"], group = vGroup, tooltip = "Shared by the desk, research lab and active price tags; remains editable with Desk Off. Medium is the desktop default. Compact desk with Brief Co-Pilot leaves more room on short displays. Large text can cover nearby chart tags.", display = display.none)
+bool vChannel = input.bool(true, "Pressure channel", group = vGroup, display = display.none, active = vView == "Full")
+bool vReference = input.bool(true, "Trend EMA", group = vGroup, display = display.none, active = vView != "Minimal")
+bool vTint = input.bool(false, "Color candles by confirmed direction", group = vGroup, display = display.none)
+bool vMarks = input.bool(true, "Entry and outcome markers", group = vGroup, display = display.none)
+bool vTags = input.bool(true, "Active price tags", group = vGroup, display = display.none, active = not IS_STRATEGY and vView != "Minimal")
+bool vPaperRecord = input.bool(false, "Show gross paper record", group = vGroup, tooltip = "Educational OHLC plan ledger, before costs. Separate from the cost-adjusted research lab and broker strategy.", display = display.none)
+int vHistory = input.int(2, "Completed plans visible", minval = 0, maxval = 8, group = vGroup, display = display.none, active = not IS_STRATEGY and vView == "Full")
+int vAhead = input.int(12, "Plan projection bars", minval = 3, maxval = 60, group = vGroup, display = display.none, active = not IS_STRATEGY and vView != "Minimal")
+string vNarrGroup = "Co-Pilot · read the reasoning"
+string vNarr = input.string(IS_STRATEGY ? "Off" : "Brief", "Explanation depth", options = ["Off", "Brief", "Standard", "Detailed"], group = vNarrGroup, display = display.none)
+string vNarrPos = input.string("Bottom Right", "Co-Pilot position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = vNarrGroup, display = display.none, active = vNarr != "Off")
+string vNarrSize = input.string("Medium", "Co-Pilot size", options = ["Small", "Medium", "Large"], group = vNarrGroup, display = display.none, active = vNarr != "Off")
+bool vWhy = input.bool(true, "Explain current gates", group = vNarrGroup, display = display.none, active = vNarr == "Standard" or vNarr == "Detailed")
+bool vPlan = input.bool(true, "Explain fixed plan", group = vNarrGroup, display = display.none, active = vNarr != "Off")
+bool vLimits = input.bool(true, "Show limitations", group = vNarrGroup, display = display.none, active = vNarr == "Standard" or vNarr == "Detailed")
+string vLabPos = input.string("Top Left", "Research position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = vGroup, display = display.none, active = inResearch)
+string vTagPlacement = input.string("In chart", "Price tag placement", options = ["In chart", "Projected"], group = vGroup, display = display.none, active = vTags and not IS_STRATEGY and vView != "Minimal", tooltip = "In chart places current-plan references in a visible lane away from the main panel. This label position is not the entry time; the original ticket remains fixed. Projected uses the plan's future endpoint and needs free right margin. Exact levels always remain in the desk.")
+int vTopInset = input.int(12, "Top Left header clearance · %", minval = 0, maxval = 25, group = vGroup, display = display.none, tooltip = "Transparent space above any Top Left panel to clear TradingView's symbol/quote/indicator header. Reduce to zero when that header is hidden; use Compact/Small on short viewports.")
+
+color vBg = vTheme == "Royal Gold" ? #141411 : #101824
+color vBand = vTheme == "Royal Gold" ? #29251D : #1B2B40
+color vStripe = vTheme == "Royal Gold" ? #1E1C17 : #152031
+color vFrame = vTheme == "Royal Gold" ? #655439 : #354B66
+color vAccent = vTheme == "Royal Gold" ? #E0C68C : #B0C8ED
+color vUp = vTheme == "Accessible" ? #64C4F7 : #52D9BC
+color vDown = vTheme == "Aurora" ? #FF8DA4 : #FFC16D
+color vText = #E9EFF7
+color vMuted = #A5B4C8
+string vBody = vSize == "Large" ? size.large : vSize == "Medium" ? size.normal : size.small
+string vHero = size.large
+string vNBody = vNarrSize == "Large" ? size.large : vNarrSize == "Medium" ? size.normal : size.small
+
+vPosition(string p) =>
+    switch p
+        "Top Left" => position.top_left
+        "Bottom Left" => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        => position.top_right
+
+vFreeCorner(string wanted, string occupied1, string occupied2) =>
+    string picked = wanted
+    if picked == occupied1 or picked == occupied2
+        picked := "Bottom Left"
+        if picked == occupied1 or picked == occupied2
+            picked := "Top Left"
+        if picked == occupied1 or picked == occupied2
+            picked := "Bottom Right"
+        if picked == occupied1 or picked == occupied2
+            picked := "Top Right"
+    picked
+
+vSide(int d) => d == 1 ? "LONG" : d == -1 ? "SHORT" : "NEUTRAL"
+vArrow(int d) => d == 1 ? "UP" : d == -1 ? "DOWN" : "FLAT"
+vColor(int d) => d == 1 ? vUp : d == -1 ? vDown : vMuted
+vNum(float n) => na(n) ? "—" : str.tostring(n, "0.00")
+vExact(float p) => na(p) ? "—" : f_jsonEntry(p)
+vPrice(float p) => na(p) ? "—" : str.tostring(p, format.mintick)
+vUnits(float q) => na(q) ? "—" : f_jsonNumber(q)
+vFlag(bool enabled, bool passes) => not enabled ? "INFO" : passes ? "PASS" : "BLOCK"
+// v1.2 · words beside the numbers, and checks that show their state as well as whether they are required.
+vPressureWord(float d) => na(d) ? "—" : math.abs(d) < 0.5 ? "flat" : math.abs(d) < 1.5 ? (d > 0 ? "leaning buy" : "leaning sell") : (d > 0 ? "strong buy" : "strong sell")
+vEfficiencyWord(float e) => na(e) ? "—" : e < 0.2 ? "choppy" : e < 0.5 ? "mixed" : "clean"
+vVolumeWord(float v) => na(v) ? "no volume" : str.tostring(v, "0.0") + "× avg"
+vTfWord(string tf) => str.contains(tf, "D") or str.contains(tf, "W") or str.contains(tf, "M") or str.contains(tf, "S") ? tf : tf + "m"
+vSessionWord() =>
+    string s = tradeSession
+    str.length(s) >= 9 ? str.substring(s, 0, 2) + ":" + str.substring(s, 2, 4) + "–" + str.substring(s, 5, 7) + ":" + str.substring(s, 7, 9) + " NY" : s + " NY"
+vJoin(string acc, string item) => acc == "" ? item : acc + " · " + item
+vMark(bool available, bool pass) => available ? pass ? "✓" : "✗" : "—"
+
+vCell(table t, int c, int r, string txt, color fg, color bg, string sz, string align = text.align_left, string tip = "") =>
+    table.cell(t, c, r + 1, txt, text_color = fg, bgcolor = bg, text_size = sz, text_halign = align, text_font_family = font.family_monospace, tooltip = tip)
+
+vWide(table t, int row, string txt, color fg, color bg, string sz, string tip = "") =>
+    table.merge_cells(t, 0, row + 1, 3, row + 1)
+    vCell(t, 0, row, txt, fg, bg, sz, text.align_left, tip)
+
+vPair(table t, int row, string labelText, string valueText, color valueColor, string tip = "") =>
+    table.merge_cells(t, 1, row + 1, 3, row + 1)
+    vCell(t, 0, row, labelText, vMuted, row % 2 == 0 ? vBg : vStripe, vBody, text.align_right, tip)
+    vCell(t, 1, row, valueText, valueColor, row % 2 == 0 ? vBg : vStripe, vBody, text.align_left, tip)
+
+vCheckRow(table t, int row, string name, bool pass, bool gate, bool available, string offText, string tip) =>
+    color bg = row % 2 == 0 ? vBg : vStripe
+    string state = offText != "" ? offText : available ? pass ? "✓ met" : "✗ not met" : "— no data"
+    table.merge_cells(t, 0, row + 1, 1, row + 1)
+    vCell(t, 0, row, name, gate ? vText : vMuted, bg, vBody, text.align_left, tip)
+    vCell(t, 2, row, state, offText != "" ? vMuted : available and pass ? vUp : available ? gate ? vDown : vMuted : vMuted, bg, vBody, text.align_left, tip)
+    vCell(t, 3, row, gate ? "● required" : "○ optional", gate ? vAccent : vMuted, bg, vBody, text.align_right, "Required checks must pass on the flip bar for its own direction. Optional checks are shown for context and never block an entry. Switch them in the entry-gate inputs.")
+
+// On-chart objects are recreated only on the last bar from a bounded ticket pool.
+// Historical price/time coordinates stay fixed; display changes do not alter outcomes.
+type VTicket
+    int dir
+    int born
+    int ended
+    float entry
+    float stop
+    float checkpoint
+    float target
+    string result
+
+var array<VTicket> vTickets = array.new<VTicket>()
+var array<line> vLines = array.new<line>()
+var array<box> vBoxes = array.new<box>()
+var array<label> vLabels = array.new<label>()
+
+vLine(int x1, int x2, float y, color c, string style, int width) =>
+    line l = line.new(x1, y, x2, y, xloc = xloc.bar_time, color = c, style = style, width = width)
+    array.push(vLines, l)
+
+vTag(int x, float actual, float placed, string txt, color c) =>
+    label tag = label.new(x, placed, txt, xloc = xloc.bar_time, style = label.style_label_left, color = vBg, textcolor = c, size = vBody, text_font_family = font.family_monospace, tooltip = "Current fixed paper plan. Label time is a viewport reference, not an entry event. Exact level: " + vExact(actual) + ". Entry close UTC: " + str.format_time(planEntryTime, "yyyy-MM-dd HH:mm", "UTC"))
+    array.push(vLabels, tag)
+    if actual != placed
+        line connector = line.new(x, actual, x, placed, xloc = xloc.bar_time, color = color.new(c, 25), style = line.style_dotted)
+        array.push(vLines, connector)
+
+vWrap(string txt, int columns) =>
+    array<string> words = str.split(txt, " ")
+    string output = ""
+    int width = 0
+    for word in words
+        if width > 0 and width + str.length(word) + 1 > columns
+            output += "\n"
+            width := 0
+        output += (width > 0 ? " " : "") + word
+        width += str.length(word) + 1
+    output
+
+// These descriptive state thresholds do not enter the engine or the research rank.
+vRegime(int direction, float score) =>
+    na(score) ? "WAIT" : direction == 0 ? "MIXED" : score < 0.5 ? "RANGE" : "TREND"
+
+float vAtr = barstate.isconfirmed ? atr : atr[1]
+float vDrift = barstate.isconfirmed ? drift : drift[1]
+float vEfficiency = barstate.isconfirmed ? efficiency : efficiency[1]
+float vRelVolume = barstate.isconfirmed ? relVolume : relVolume[1]
+float vEma = barstate.isconfirmed ? ema : ema[1]
+float vCenter = barstate.isconfirmed ? center : center[1]
+float vUpper = barstate.isconfirmed ? upperBand : upperBand[1]
+float vLower = barstate.isconfirmed ? lowerBand : lowerBand[1]
+float vClose = barstate.isconfirmed ? close : close[1]
+bool vReady = barstate.isconfirmed ? ready : ready[1]
+bool vVolReady = barstate.isconfirmed ? volReady : volReady[1]
+bool vSessionOk = barstate.isconfirmed ? inSession : inSession[1]
+int vClock = barstate.isconfirmed ? time_close : time_close[1]
+int vClosedBar = barstate.isconfirmed ? bar_index : bar_index - 1
+int vPlanAge = planActive ? math.max(0, vClosedBar - planEntryBar) : 0
+int vBarsLeft = math.max(0, maxHoldBars - vPlanAge)
+bool vHistoryReady = barstate.isconfirmed ? commonGateReady : commonGateReady[1]
+float vPositiveCount = barstate.isconfirmed ? volumeValidCount : volumeValidCount[1]
+bool vSensitivityPass = trend == 1 ? sensitivityLongOk : trend == -1 ? sensitivityShortOk : false
+string vNext = trend == 1 ? "Next flip: close below " + vExact(trail) : trend == -1 ? "Next flip: close above " + vExact(trail) : "Wait for trail initialization"
+string vPlanClock = "AGE " + str.tostring(vPlanAge) + "/" + str.tostring(maxHoldBars) + " bars · " + str.tostring(vBarsLeft) + " to expiry"
+float vPlanDisplacement = planActive and planRisk > 0 ? planDir * (vClose - planEntry) / planRisk : na
+string vPlanFreshness = vPlanAge == 0 ? "NEW ON LAST CLOSE · paper entry" : "MONITOR ONLY · entry " + str.tostring(vPlanAge) + (vPlanAge == 1 ? " bar ago" : " bars ago")
+string vDisplacementText = "Closed price " + (vPlanDisplacement > 0 ? "+" : "") + vNum(vPlanDisplacement) + "R vs entry · before costs"
+bool vEmaPass = trend == 1 ? vClose > vEma : trend == -1 ? vClose < vEma : false
+bool vEffPass = not na(vEfficiency) and vEfficiency >= efficiencyMin
+int vAligned = trend == 1 ? mtfBull : trend == -1 ? mtfBear : 0
+bool vMtfPass = mtfCount > 0 and float(vAligned) / mtfCount >= mtfRequired
+bool vHtfAvailable = sensitivityGate and sensitivityReady
+int vGateCount = (emaGate ? 1 : 0) + (efficiencyGate ? 1 : 0) + (mtfGate ? 1 : 0) + (sessionGate ? 1 : 0) + (sensitivityGate ? 1 : 0)
+int vGatePassed = (emaGate and vEmaPass ? 1 : 0) + (efficiencyGate and vEffPass ? 1 : 0) + (mtfGate and vMtfPass ? 1 : 0) + (sessionGate and vSessionOk ? 1 : 0) + (sensitivityGate and vHtfAvailable and vSensitivityPass ? 1 : 0)
+string vChecksHeader = "NOW · " + vArrow(trend) + " TRAIL · " + (vGateCount == 0 ? "no optional filters required" : str.tostring(vGatePassed) + " of " + str.tostring(vGateCount) + " required met")
+string vBlock = not vHistoryReady ? "Waiting for calculation history" : not vReady ? "ATR unavailable or zero · entries blocked" : not vVolReady ? "Volume window " + str.tostring(nz(vPositiveCount), "0") + "/" + str.tostring(volumeLen) + " positive · entries blocked" : sensitivityGate and not sensitivityReady ? "HTF sensitivity history unavailable" : vNext + " + enabled gates"
+string vState = planActive ? vSide(planDir) + " PLAN ACTIVE" : not vHistoryReady ? "WARMING UP" : not vReady ? "ATR DATA WAIT" : not vVolReady ? "VOLUME WAIT" : sensitivityGate and not sensitivityReady ? "HTF DATA WAIT" : vSide(trend) + " BIAS · WAIT"
+color vStateColor = planActive ? vColor(planDir) : not vReady or not vVolReady ? vMuted : vColor(trend)
+
+vPlotUpper = plot(vChannel and vView == "Full" ? vUpper : na, "Pressure envelope upper", color.new(vColor(trend), 82), 1, display = display.all - display.status_line - display.price_scale)
+vPlotLower = plot(vChannel and vView == "Full" ? vLower : na, "Pressure envelope lower", color.new(vColor(trend), 82), 1, display = display.all - display.status_line - display.price_scale)
+fill(vPlotUpper, vPlotLower, color.new(vColor(trend), 95), title = "Pressure context channel")
+plot(vView == "Full" ? vCenter : na, "Pressure center", color.new(vAccent, 30), 1, display = display.all - display.status_line - display.price_scale)
+plot(trend == 1 ? trail : na, "Bullish ratchet", vUp, 3, plot.style_linebr, display = display.all - display.status_line - display.price_scale)
+plot(trend == -1 ? trail : na, "Bearish ratchet", vDown, 3, plot.style_linebr, display = display.all - display.status_line - display.price_scale)
+plot(vReference and vView != "Minimal" ? vEma : na, "Trend EMA reference", color.new(vAccent, 25), 2, display = display.all - display.status_line - display.price_scale)
+plot(sensitivityGate and sensitivityReady and vView != "Minimal" ? sensitivityReference : na, "Confirmed HTF sensitivity EMA", color.new(vAccent, 15), 2, plot.style_stepline, display = display.all - display.status_line - display.price_scale)
+barcolor(vTint ? color.new(vColor(trend), 15) : na, title = "Confirmed trend candle tint")
+plotshape(not IS_STRATEGY and vMarks and signalLong, "Accepted paper long", shape.labelup, location.belowbar, vUp, text = "LONG", textcolor = #101824, size = size.tiny, display = display.all - display.status_line - display.price_scale)
+plotshape(not IS_STRATEGY and vMarks and signalShort, "Accepted paper short", shape.labeldown, location.abovebar, vDown, text = "SHORT", textcolor = #101824, size = size.tiny, display = display.all - display.status_line - display.price_scale)
+plotshape(not IS_STRATEGY and vMarks and planClosed and planLastR > 0, "Positive paper outcome", shape.circle, location.abovebar, vUp, text = "EXIT", textcolor = vUp, size = size.tiny, display = display.all - display.status_line - display.price_scale)
+plotshape(not IS_STRATEGY and vMarks and planClosed and planLastR <= 0, "Nonpositive paper outcome", shape.xcross, location.belowbar, vDown, text = "EXIT", textcolor = vDown, size = size.tiny, display = display.all - display.status_line - display.price_scale)
+plot(vDrift, "Confirmed drift score", display = display.data_window)
+plot(vEfficiency, "Confirmed efficiency", display = display.data_window)
+plot(vRelVolume, "Confirmed relative volume", display = display.data_window)
+plot(mtfCount, "Eligible timeframe count", display = display.data_window)
+plot(vAligned, "Timeframes aligned to chart trend", display = display.data_window)
+plot(planActive ? planEntry : na, "Active paper entry", display = display.data_window)
+plot(planActive ? planStop : na, "Active paper stop", display = display.data_window)
+plot(planActive ? planTarget : na, "Active paper target", display = display.data_window)
+
+if barstate.isconfirmed
+    if planClosed and array.size(vTickets) > 0
+        VTicket last = array.get(vTickets, array.size(vTickets) - 1)
+        if last.ended == 0
+            last.ended := time_close
+            last.result := planExitReason + (vPaperRecord ? " · " + vNum(planLastR) + "R" : "")
+    if signalLong or signalShort
+        array.push(vTickets, VTicket.new(planDir, planEntryTime, 0, planEntry, planStop, planTP1, planTarget, ""))
+    // An active ticket never consumes the user's completed-history allowance.
+    int completed = 0
+    for ticket in vTickets
+        if ticket.ended != 0
+            completed += 1
+    while completed > vHistory
+        VTicket oldest = array.shift(vTickets)
+        if oldest.ended != 0
+            completed -= 1
+
+// Visible references affect only rendering, never signal history or acceptance.
+var float vVisibleHigh = na
+var float vVisibleLow = na
+if time == chart.left_visible_bar_time
+    vVisibleHigh := high
+    vVisibleLow := low
+else if time > chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+    vVisibleHigh := math.max(nz(vVisibleHigh, high), high)
+    vVisibleLow := math.min(nz(vVisibleLow, low), low)
+
+// Every allocated table needs a unique anchor, even when cleared/disabled.
+// Otherwise an invisible table can replace a visible table at the same anchor.
+string vWantedDesk = vDesk != "Off" ? vDeskPos : ""
+string vWantedNarr = vNarr != "Off" ? vFreeCorner(vNarrPos, vWantedDesk, "") : ""
+string vWantedLab = labEnabled ? vFreeCorner(vLabPos, vWantedDesk, vWantedNarr) : ""
+string vUsedDesk = vDesk != "Off" ? vWantedDesk : vFreeCorner(vDeskPos, vWantedNarr, vWantedLab)
+string vUsedNarr = vNarr != "Off" ? vWantedNarr : vFreeCorner(vNarrPos, vUsedDesk, vWantedLab)
+string vUsedLab = labEnabled ? vWantedLab : vFreeCorner(vLabPos, vUsedDesk, vUsedNarr)
+bool vLeftPanel = (vDesk != "Off" and str.contains(vUsedDesk, "Left")) or (vNarr != "Off" and str.contains(vUsedNarr, "Left")) or (labEnabled and str.contains(vUsedLab, "Left"))
+int vReferenceTime = chart.left_visible_bar_time + int((chart.right_visible_bar_time - chart.left_visible_bar_time) * (vLeftPanel ? 0.52 : 0.15))
+
+if barstate.islast
+    for l in vLines
+        line.delete(l)
+    for b in vBoxes
+        box.delete(b)
+    for lbl in vLabels
+        label.delete(lbl)
+    array.clear(vLines)
+    array.clear(vBoxes)
+    array.clear(vLabels)
+    int projectionTime = time_close + int(timeframe.in_seconds() * 1000) * vAhead
+    for ticket in vTickets
+        bool active = ticket.ended == 0
+        bool showTicket = not IS_STRATEGY and (vView == "Full" or (active and vView == "Focus"))
+        if showTicket
+            int rightTime = active ? projectionTime : ticket.ended
+            color sideColor = vColor(ticket.dir)
+            int fade = active ? 0 : 72
+            array.push(vBoxes, box.new(ticket.born, math.max(ticket.entry, ticket.target), rightTime, math.min(ticket.entry, ticket.target), xloc = xloc.bar_time, border_color = na, bgcolor = color.new(sideColor, active ? 91 : 97)))
+            array.push(vBoxes, box.new(ticket.born, math.max(ticket.entry, ticket.stop), rightTime, math.min(ticket.entry, ticket.stop), xloc = xloc.bar_time, border_color = na, bgcolor = color.new(vDown, active ? 90 : 97)))
+            vLine(ticket.born, rightTime, ticket.entry, color.new(vAccent, fade), line.style_solid, active ? 2 : 1)
+            vLine(ticket.born, rightTime, ticket.stop, color.new(vDown, fade), line.style_solid, active ? 2 : 1)
+            vLine(ticket.born, rightTime, ticket.target, color.new(sideColor, fade), line.style_solid, active ? 2 : 1)
+            if active
+                vLine(ticket.born, rightTime, ticket.checkpoint, color.new(sideColor, 35), line.style_dashed, 1)
+                if vTags
+                    array<float> levels = array.from(ticket.stop, ticket.entry, ticket.checkpoint, ticket.target)
+                    array<int> sorted = array.sort_indices(levels, order.ascending)
+                    float occupied = na
+                    float spacing = math.max(math.max(nz(vAtr) * 0.22, syminfo.mintick * 3), nz(vVisibleHigh - vVisibleLow) * (vSize == "Large" ? 0.05 : 0.032))
+                    int tagTime = vTagPlacement == "In chart" ? vReferenceTime : rightTime
+                    for index in sorted
+                        float actual = array.get(levels, index)
+                        float placed = na(occupied) ? actual : math.max(actual, occupied + spacing)
+                        string caption = index == 0 ? "SL  " + vPrice(actual) : index == 1 ? "ENTRY  " + vExact(actual) : index == 2 ? "1R CHECK  " + vPrice(actual) : "TARGET  " + vPrice(actual)
+                        color tagColor = index == 0 ? vDown : index == 1 ? vAccent : sideColor
+                        if vTagPlacement == "In chart"
+                            // Dotted extension identifies a current reference, never historical availability.
+                            vLine(math.min(tagTime, ticket.born), math.max(tagTime, ticket.born), actual, color.new(tagColor, 65), line.style_dotted, 1)
+                        vTag(tagTime, actual, placed, "PLAN " + caption, tagColor)
+                        occupied := placed
+            else if vMarks
+                array.push(vLabels, label.new(rightTime, ticket.target, ticket.result, xloc = xloc.bar_time, style = label.style_label_left, color = color.new(vBg, 25), textcolor = vMuted, size = size.tiny))
+
+var table vTable = table.new(vPosition(vUsedDesk), 4, 31, bgcolor = na, frame_width = 0)
+var table vCopilot = table.new(vPosition(vUsedNarr), 2, 9, bgcolor = na, frame_width = 0)
+
+if barstate.islast
+    table.clear(vTable, 0, 0, 3, 30)
+    table.set_frame_width(vTable, vDesk == "Off" ? 0 : 1)
+    table.set_frame_color(vTable, vFrame)
+    table.set_position(vTable, vPosition(vUsedDesk))
+    if vDesk != "Off"
+        table.cell(vTable, 0, 0, "", height = vUsedDesk == "Top Left" ? vTopInset : 0, bgcolor = na)
+        vWide(vTable, 0, "DRIFT DESK                  OPEN SOURCE", vAccent, vBand, vBody)
+        vWide(vTable, 1, (planActive ? "● " : "") + vState, vStateColor, vBg, vHero, "WARMING UP / DATA WAIT: the engine cannot judge yet. UP or DOWN TREND · WAIT: the trail has a direction, no plan is open. PLAN ACTIVE: a paper plan with fixed levels is open.")
+        vWide(vTable, 2, vWrap(planActive ? vPlanFreshness + (vVolReady ? "" : " · volume blocks new entries") : vBlock, 43), vText, vBg, vBody, "An existing paper ticket is a monitoring reference, not a current entry offer. Even a new accepted close may differ from the live executable price.")
+        // Ribbon: done · in progress (amber) · not yet. CHECKS counts required checks for the current trail direction.
+        bool stepTrail = vReady and trend != 0
+        bool stepFlip = not na(lastFlipBar) and lastFlipBar == vClosedBar
+        bool checksDone = vGateCount > 0 and vGatePassed == vGateCount
+        bool checksPending = vGateCount > 0 and not checksDone
+        string checksTxt = vGateCount == 0 ? "03 CHECKS —" : "03 CHECKS " + str.tostring(vGatePassed) + "/" + str.tostring(vGateCount)
+        vCell(vTable, 0, 3, "01 TRAIL" + (stepTrail ? " ✓" : ""), stepTrail ? vBg : vMuted, stepTrail ? color.new(vStateColor, 20) : vBand, vBody, text.align_center, "The confirmed pressure trail has a direction.")
+        vCell(vTable, 1, 3, "FLIP " + (na(lastFlipBar) ? "—" : str.tostring(math.max(0, vClosedBar - lastFlipBar)) + "b ago"), stepFlip ? vBg : vMuted, stepFlip ? color.new(vStateColor, 20) : vBand, vBody, text.align_center, "Historical age of the latest raw flip. This can differ from the active plan's entry event; a flip alone is not accepted entry.")
+        vCell(vTable, 2, 3, checksTxt, checksDone or checksPending ? vBg : vMuted, checksDone ? color.new(vStateColor, 20) : checksPending ? color.new(vAccent, 45) : vBand, vBody, text.align_center, "Required checks met over required checks enabled, evaluated for the current trail direction on the last closed bar. — means no check is required.")
+        vCell(vTable, 3, 3, "04 PLAN" + (planActive ? " ▶" : ""), planActive ? vBg : vMuted, planActive ? color.new(vStateColor, 20) : vBand, vBody, text.align_center, "A paper plan with entry, stop, checkpoint and target is open.")
+        vPair(vTable, 4, "RUN", "ATR " + str.tostring(atrLen) + " × " + str.tostring(bandMult, "0.##") + " · target " + str.tostring(rewardR, "0.##") + "R · " + (sensitivityGate ? "HTF EMA " + vTfWord(sensitivityTf) : "HTF EMA off"), vText, "Manual operating parameters; never adopted from the research winner. Pressure EMA " + str.tostring(pressureFastLen) + "/" + str.tostring(pressureSlowLen) + ", deviation " + str.tostring(normalizationLen) + ". Target R is requested; active geometry reports actual rounded R.")
+        vWide(vTable, 5, "PRESSURE " + vNum(vDrift) + " · " + vPressureWord(vDrift) + "\nefficiency " + vNum(vEfficiency) + " " + vEfficiencyWord(vEfficiency) + " · volume " + vVolumeWord(vRelVolume), vAccent, vStripe, vBody, "Pressure is a normalized candle-pressure proxy (−3 to +3), not order flow: flat below 0.5, leaning to 1.5, strong beyond. Efficiency is the price-path efficiency ratio (0 to 1): choppy below 0.2, mixed to 0.5, clean above. Volume is relative to its average. Values use the latest closed chart bar.")
+        int row = 6
+        if vDesk == "Full"
+            vCell(vTable, 0, row, "FRAME", vMuted, vBand, vBody, text.align_right)
+            vCell(vTable, 1, row, "TREND", vMuted, vBand, vBody)
+            vCell(vTable, 2, row, "STATE / SCORE", vMuted, vBand, vBody, text.align_right)
+            vCell(vTable, 3, row, "SOURCE", vMuted, vBand, vBody, text.align_right)
+            row += 1
+            for i = 0 to 7
+                string tfName = array.get(mtfNames, i)
+                string tfText = tfName == "60" ? "1h" : tfName == "240" ? "4h" : tfName == "D" or tfName == "W" ? tfName : tfName + "m"
+                bool eligible = array.get(mtfEligible, i)
+                int direction = array.get(mtfDirs, i)
+                string stateText = array.get(mtfStates, i)
+                bool lower = str.contains(stateText, "LOWER")
+                string sourceKey = lower ? "LOWER" : not eligible ? "WAIT" : array.get(mtfIsLocal, i) ? "CLOSE" : timeframe.in_seconds(tfName) > timeframe.in_seconds() ? "HTF [1]" : "SRC [1]"
+                // The keys above are the engine's categories; the trader reads them in words.
+                string sourceText = sourceKey == "LOWER" ? "below chart" : sourceKey == "WAIT" ? "no data yet" : sourceKey == "CLOSE" ? "this chart" : sourceKey == "HTF [1]" ? "closed bar" : "closed alias"
+                string strengthText = eligible ? vRegime(direction, array.get(mtfStrength, i)) + " " + vNum(array.get(mtfStrength, i)) : "—"
+                color rowBg = i % 2 == 0 ? vBg : vStripe
+                vCell(vTable, 0, row, tfText, vMuted, rowBg, vBody, text.align_right)
+                vCell(vTable, 1, row, eligible ? vArrow(direction) : "—", eligible ? vColor(direction) : vMuted, rowBg, vBody)
+                vCell(vTable, 2, row, strengthText, vText, rowBg, vBody, text.align_right, "Descriptive EMA proxy only: MIXED when direction is neutral; otherwise RANGE below score 0.5 and TREND at/above 0.5. Displayed score is rounded; category uses raw score " + vExact(array.get(mtfStrength, i)) + ". Score is ATR-normalized EMA separation + slope, capped at 3. Not a gate or probability.")
+                vCell(vTable, 3, row, sourceText, vMuted, rowBg, vBody, text.align_right, lower ? "Below chart resolution: intentionally excluded from consensus." : sourceKey == "WAIT" ? "This frame has no completed eligible observation yet." : sourceKey == "CLOSE" ? "The chart's own closed bar." : sourceKey == "HTF [1]" ? "The previous completed higher-timeframe bar. Minutes since its close: " + vNum(array.get(mtfAge, i)) : "An equal-duration alias of the chart on a different calendar; its previous completed bar. Minutes since close: " + vNum(array.get(mtfAge, i)))
+                row += 1
+        int rangeCount = 0
+        for i = 0 to 7
+            if array.get(mtfEligible, i) and vRegime(array.get(mtfDirs, i), array.get(mtfStrength, i)) == "RANGE"
+                rangeCount += 1
+        vPair(vTable, row, "ALIGN", str.tostring(vAligned) + "/" + str.tostring(mtfCount) + " with TRAIL " + vArrow(trend) + "\nUP " + str.tostring(mtfBull) + " / DOWN " + str.tostring(mtfBear) + " / FLAT " + str.tostring(mtfCount - mtfBull - mtfBear) + " · RANGE " + str.tostring(rangeCount), vColor(trend), "All counts include eligible rows only; RANGE overlaps directional counts. Chart pressure-trail direction is the comparison anchor. The local EMA matrix row is a different model and can disagree. Only eligible rows count; neutral rows stay in the denominator. Agreement is not confidence.")
+        row += 1
+        vWide(vTable, row, vChecksHeader, vAccent, vBand, vBody, "Current checks for the displayed trail direction. A future opposite flip re-evaluates every enabled gate for its own direction at that close; a current ✓ or current PASS is not an entry.")
+        row += 1
+        // Five checks, required ones first. Names carry the operating value so the row reads without opening the inputs.
+        array<string> cNames = array.from("Chart EMA " + str.tostring(emaLen), "Path efficiency ≥ " + str.tostring(efficiencyMin, "0.##"), "Frames agree ≥ " + str.tostring(math.round(mtfRequired * 100)) + "%", "Session " + vSessionWord(), "HTF EMA " + vTfWord(sensitivityTf) + "/" + str.tostring(sensitivityLen) + (vHtfAvailable ? " · " + vPrice(sensitivityReference) : ""))
+        array<bool> cPass = array.from(vEmaPass, vEffPass, vMtfPass, vSessionOk, vSensitivityPass)
+        array<bool> cGate = array.from(emaGate, efficiencyGate, mtfGate, sessionGate, sensitivityGate)
+        array<bool> cAvail = array.from(not na(vEma), not na(vEfficiency), mtfCount > 0, true, vHtfAvailable)
+        array<string> cOff = array.from("", "", "", "", sensitivityGate ? "" : "— off")
+        array<string> cTips = array.from("Confirmed close on the trail's side of the chart EMA " + str.tostring(emaLen) + ".", "Absolute displacement over " + str.tostring(efficiencyLen) + " bars divided by the path travelled; a rule threshold, not a probability.", "Eligible higher-frame rows pointing the trail's way, over all eligible rows (neutral rows stay in the denominator).", "The bar opened inside the configured New York session.", sensitivityGate ? "Previous completed " + vTfWord(sensitivityTf) + " EMA " + str.tostring(sensitivityLen) + "; raw reference " + vExact(sensitivityReference) + ". Confirmed chart close compared in the trail direction. Source close UTC: " + (na(sensitivityStamp) ? "unavailable" : str.format_time(sensitivityStamp, "yyyy-MM-dd HH:mm", "UTC")) + ". Drift's actual HTF reference, not the vendor's timeframe-scaled EMA." : "Off: no higher-timeframe EMA reference is required. Turn it on in the entry-gate inputs; the reference must be strictly above the chart timeframe.")
+        for pass = 0 to 1
+            for k = 0 to 4
+                bool gate = array.get(cGate, k)
+                if (pass == 0 and gate) or (pass == 1 and not gate)
+                    vCheckRow(vTable, row, array.get(cNames, k), array.get(cPass, k), gate, array.get(cAvail, k), array.get(cOff, k), array.get(cTips, k))
+                    row += 1
+        if planActive
+            vPair(vTable, row, "ENTRY", vExact(planEntry), vAccent)
+            row += 1
+            vPair(vTable, row, "STOP", vPrice(planStop) + "  /  " + vExact(planRisk) + " distance", vDown)
+            row += 1
+            float actualR = math.abs(planTarget - planEntry) / planRisk
+            vPair(vTable, row, "TARGET", vPrice(planTarget) + "  /  " + vNum(actualR) + "R", vColor(planDir))
+            row += 1
+            vPair(vTable, row, "SIZE", vUnits(planQty) + " units · " + vNum(planQty * planRisk * syminfo.pointvalue) + " " + syminfo.currency, vText, "Planned price risk only, before costs/gaps. No FX account conversion or broker lot validation.")
+            row += 1
+            vWide(vTable, row, vPlanClock + "\n" + vDisplacementText + "\n" + (planTP1Seen ? "1R seen · fixed stop / target" : "1R pending · fixed stop / target"), vMuted, vStripe, vBody, "Original entry close UTC: " + str.format_time(planEntryTime, "yyyy-MM-dd HH:mm", "UTC") + ". Displacement is the last closed chart price versus the original entry, divided by original price risk, signed for the plan. It is not a fill, a new trade's R:R or realized P&L. Timeout follows opening-gap and normal exit priority.")
+            row += 1
+        else
+            vPair(vTable, row, "LAST", paperTrades > 0 ? planExitReason + (vPaperRecord ? " · paper " + vNum(planLastR) + "R" : " · paper plan") : "No completed plan", vMuted, "Gross paper R excludes costs. TradingView's strategy ledger is separate.")
+            row += 1
+            vWide(vTable, row, vWrap(na(lastFlipBar) ? "No confirmed flip observed yet" : "LAST FLIP · " + str.tostring(math.max(0, vClosedBar - lastFlipBar)) + " bars ago · " + blockedReason, 43), vMuted, vStripe, vBody, na(lastFlipTime) ? "Historical event, separate from the current NEXT condition." : "Historical flip close UTC: " + str.format_time(lastFlipTime, "yyyy-MM-dd HH:mm", "UTC") + ". Its outcome is not the current gate state.")
+            row += 1
+        if vPaperRecord
+            vWide(vTable, row, "GROSS PAPER · " + str.tostring(paperTrades) + " closed · " + vNum(paperNetR) + "R\nCosts excluded · " + str.tostring(paperAmbiguous) + " ambiguous bars", vMuted, vStripe, vBody)
+            row += 1
+        vWide(vTable, row, "CLOSED BARS · " + syminfo.ticker + " · " + timeframe.period + "\nProEA Lab  /  " + DRIFT_VERSION + "  /  rules you can inspect", vMuted, vBand, size.tiny)
+
+    table.clear(vCopilot, 0, 0, 1, 8)
+    table.set_frame_width(vCopilot, vNarr == "Off" ? 0 : 1)
+    table.set_frame_color(vCopilot, vFrame)
+    table.set_position(vCopilot, vPosition(vUsedNarr))
+    if vNarr != "Off"
+        table.cell(vCopilot, 0, 0, "", height = vUsedNarr == "Top Left" ? vTopInset : 0, bgcolor = na)
+        table.merge_cells(vCopilot, 0, 1, 1, 1)
+        vCell(vCopilot, 0, 0, "CO-PILOT  /  THE READ BEHIND THE CHART", vAccent, vBand, vNBody)
+        string readText = not vReady ? (not vHistoryReady ? "The engine needs more closed bars." : "ATR is unavailable or zero; new plans are blocked.") : not vVolReady ? "Volume is missing or recovering. Need " + str.tostring(volumeLen) + " positive bars across the full window. Context continues; new plans are blocked." : "The confirmed trail points " + (trend == 1 ? "upward" : "downward") + "; pressure " + vNum(vDrift) + " (" + vPressureWord(vDrift) + "), efficiency " + vNum(vEfficiency) + " (" + vEfficiencyWord(vEfficiency) + "), volume " + vVolumeWord(vRelVolume) + "." + (planActive and planDir != trend ? " The existing " + vSide(planDir) + " plan keeps its fixed levels." : "")
+        string planText = planActive ? vPlanFreshness + ". " + vSide(planDir) + " from " + vExact(planEntry) + ". Stop " + vPrice(planStop) + "; target " + vPrice(planTarget) + ". " + vDisplacementText + "." : "No active paper plan. " + vBlock + "."
+        // WHY names every check with its state, required ones first; a list a trader can act on, not a verdict.
+        string reqText = ""
+        string optText = ""
+        if emaGate
+            reqText := vJoin(reqText, "chart EMA " + vMark(not na(vEma), vEmaPass))
+        else
+            optText := vJoin(optText, "chart EMA " + vMark(not na(vEma), vEmaPass))
+        if efficiencyGate
+            reqText := vJoin(reqText, "efficiency " + vMark(not na(vEfficiency), vEffPass))
+        else
+            optText := vJoin(optText, "efficiency " + vMark(not na(vEfficiency), vEffPass))
+        if mtfGate
+            reqText := vJoin(reqText, "frames " + str.tostring(vAligned) + "/" + str.tostring(mtfCount) + " " + vMark(mtfCount > 0, vMtfPass))
+        else
+            optText := vJoin(optText, "frames " + str.tostring(vAligned) + "/" + str.tostring(mtfCount) + " " + vMark(mtfCount > 0, vMtfPass))
+        if sessionGate
+            reqText := vJoin(reqText, "session " + vMark(true, vSessionOk))
+        else
+            optText := vJoin(optText, "session " + vMark(true, vSessionOk))
+        if sensitivityGate
+            reqText := vJoin(reqText, "HTF EMA " + vMark(vHtfAvailable, vSensitivityPass))
+        else
+            optText := vJoin(optText, "HTF EMA off")
+        string whyText = "Required: " + (reqText == "" ? "no optional filters; usable data, risk checks and an available paper slot still apply" : reqText) + ". Optional: " + optText + ". Current checks do not authorize a new entry. A new flip rechecks its own direction; blocked flips are not queued."
+        string limitText = "Agreement is not win probability. The 1R line is a checkpoint; it does not move the stop."
+        array<string> nLabels = array.from("READ", "WHY", "PLAN", "WATCH", "LIMITS", "AT ENTRY")
+        array<string> nTexts = array.from(readText, whyText, planText, planActive ? "A fresh market read never rewrites this ticket. Gaps can exceed planned risk." : vBlock + ".", limitText, planActive ? planReason : "No active entry snapshot.")
+        int nr = 1
+        for i = 0 to 5
+            bool showRow = i == 0 or (i == 1 and vWhy and vNarr != "Brief") or (i == 2 and vPlan) or (i == 3 and vNarr == "Detailed") or (i == 4 and vLimits and vNarr != "Brief") or (i == 5 and vNarr == "Detailed")
+            if showRow
+                vCell(vCopilot, 0, nr, array.get(nLabels, i), vMuted, nr % 2 == 0 ? vStripe : vBg, vNBody, text.align_right)
+                vCell(vCopilot, 1, nr, vWrap(array.get(nTexts, i), 42), vText, nr % 2 == 0 ? vStripe : vBg, vNBody)
+                nr += 1
+
+// Research is opt-in. This renderer cannot adopt a winner into operating inputs.
+var table vResearch = table.new(vPosition(vUsedLab), 4, 24, bgcolor = na, frame_width = 0)
+if barstate.islast
+    table.clear(vResearch, 0, 0, 3, 23)
+    table.set_frame_width(vResearch, labEnabled ? 1 : 0)
+    table.set_frame_color(vResearch, vFrame)
+    table.set_position(vResearch, vPosition(vUsedLab))
+    if labEnabled
+        table.cell(vResearch, 0, 0, "", height = vUsedLab == "Top Left" ? vTopInset : 0, bgcolor = na)
+        vWide(vResearch, 0, "RESEARCH LAB              12 FIXED CELLS", vAccent, vBand, vBody)
+        vWide(vResearch, 1, vWrap(labStatus, 43), vText, vBg, vBody)
+        vCell(vResearch, 0, 2, "ATR / BAND", vMuted, vBand, vBody, text.align_right)
+        vCell(vResearch, 1, 2, "CLOSED", vMuted, vBand, vBody, text.align_right)
+        vCell(vResearch, 2, 2, "MEAN R", vMuted, vBand, vBody, text.align_right)
+        vCell(vResearch, 3, 2, "DD R", vMuted, vBand, vBody, text.align_right)
+        for i = 0 to 11
+            color bg = i == labWinner ? vBand : i % 2 == 0 ? vBg : vStripe
+            color fg = i == labWinner ? vAccent : vMuted
+            string candidateName = str.tostring(array.get(labAtrLens, i)) + " / " + str.tostring(array.get(labMultipliers, i), "0.0") + (i == labWinner ? " *" : "")
+            int trades = array.get(labTrainTrades, i)
+            string rowDetail = "Open plan: " + (array.get(labTrainActive, i) ? "yes" : "no") + "\nAmbiguous exits: " + str.tostring(array.get(labTrainAmbiguous, i)) + "\nForced boundary exits: " + str.tostring(array.get(labTrainBoundaryExits, i)) + "\nOnly resolved trades enter these metrics."
+            vCell(vResearch, 0, i + 3, candidateName, fg, bg, vBody, text.align_right, rowDetail)
+            vCell(vResearch, 1, i + 3, str.tostring(trades) + (array.get(labTrainActive, i) ? "+" : ""), vText, bg, vBody, text.align_right, rowDetail)
+            float meanR = array.get(labTrainMeanR, i)
+            vCell(vResearch, 2, i + 3, trades > 0 ? vNum(meanR) : "—", na(meanR) ? vMuted : meanR > 0 ? vUp : vDown, bg, vBody, text.align_right)
+            vCell(vResearch, 3, i + 3, trades > 0 ? vNum(array.get(labTrainDD, i)) : "—", vMuted, bg, vBody, text.align_right, "Closed-trade equity drawdown in R; not intratrade drawdown. Commission and slippage use the lab's standardized cost model.")
+        vWide(vResearch, 15, "VALIDATION          CLOSED / MEAN R / DD", vAccent, vBand, vBody)
+        for j = 0 to 1
+            int n = array.get(labValTrades, j)
+            string results = str.tostring(n) + (array.get(labValActive, j) ? "+" : "") + " / " + (n > 0 ? vNum(array.get(labValMeanR, j)) : "—") + " / " + (n > 0 ? vNum(array.get(labValDD, j)) : "—")
+            string rowDetail = "Open plan: " + (array.get(labValActive, j) ? "yes" : "no") + "\nAmbiguous exits: " + str.tostring(array.get(labValAmbiguous, j)) + "\nForced boundary exits: " + str.tostring(array.get(labValBoundaryExits, j)) + "\nOnly resolved trades enter these metrics."
+            vPair(vResearch, 16 + j, j == 0 ? "FROZEN" : "MANUAL", j == 0 and labWinner < 0 ? "No eligible train leader" : results, vText, rowDetail)
+        string actualBoundaries = "Observed train freeze UTC: " + (na(labFreezeTime) ? "pending" : str.format_time(labFreezeTime, "yyyy-MM-dd HH:mm", "UTC")) + "\nObserved validation end UTC: " + (na(labEndTime) ? "pending" : str.format_time(labEndTime, "yyyy-MM-dd HH:mm", "UTC"))
+        vWide(vResearch, 18, "TRAIN " + (labTrainCovered ? "covered" : labPhase == 0 ? "pending" : "incomplete") + " · VALIDATION " + (labValidationCovered ? "covered" : labPhase < 3 ? "pending" : "incomplete"), vMuted, vStripe, vBody, actualBoundaries)
+        vWide(vResearch, 19, "Train rank only · costs included\nManual operating parameters never change", vMuted, vBg, vBody)
+        vWide(vResearch, 20, "+ means open · hover rows for exit details\nInspecting validation consumes independence.", vMuted, vBand, size.tiny)
+        vWide(vResearch, 21, str.format_time(labTrainStart, "yyyy-MM-dd", "UTC") + " → " + str.format_time(labSplit, "yyyy-MM-dd", "UTC") + "\nValidation to " + str.format_time(labValidationEnd, "yyyy-MM-dd", "UTC") + " · UTC", vMuted, vBg, size.tiny)
+        vWide(vResearch, 22, "Cost / side: " + vNum(labCommission) + "% + " + str.tostring(labSlippage) + " ticks\nMinimum train count: " + str.tostring(labMinTrades), vMuted, vBg, size.tiny)
