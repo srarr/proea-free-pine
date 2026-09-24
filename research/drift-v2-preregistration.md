@@ -40,3 +40,23 @@ If any condition fails, we publish the result as a failed test, as we did for th
 When the files are published, download them and compare their fingerprints:
 `sha256sum PROTOCOL-v2.md DEV-GRID-v2.md gate-v2.mjs` (Windows: `Get-FileHash -Algorithm SHA256 <file>`).
 They must equal the table above. This file's own commit time on GitHub is the public timestamp.
+
+## Amendment v2-A2 (posted before the final test runs)
+
+The rules file was amended once after the fingerprints above were posted. The **pass rule
+(`gate-v2.mjs`) and the tested configurations (`DEV-GRID-v2.md`) did not change.**
+
+| File | New SHA-256 | Committed in our lab (UTC+7) |
+|---|---|---|
+| `PROTOCOL-v2.md` (rules incl. amendments v2-A1 and v2-A2) | `5ce2e6c473969d54eadb8eaddf832563b0c846e99bc18f8257c463614f1b264b` | 2026-09-24 17:46 |
+
+What v2-A2 does, made after development and selection on other coins and **before any result on the
+12 final-test coins**:
+
+- keeps ICX in the final coin set, as the written selection rule requires, and corrects the rules'
+  statement that every final-test coin was still trading (Binance delisted ICX on 2026-09-03);
+- fixes how an open position and the "holding" benchmark end when a coin's data stops early;
+- fixes the final test's scope (one configuration, run once, with its comparisons and cost scenarios);
+- discloses that some selection readings were fixed after development results were seen.
+
+Status when this was posted: the final test on the 12 coins has **not** run.
