@@ -60,3 +60,24 @@ What v2-A2 does, made after development and selection on other coins and **befor
 - discloses that some selection readings were fixed after development results were seen.
 
 Status when this was posted: the final test on the 12 coins has **not** run.
+
+## Correction (posted 2026-09-24, after the final test ran)
+
+Two sentences above say more than our records support. This section corrects their wording only:
+the fingerprints, the pass rule (`gate-v2.mjs`) and amendment v2-A2 are unchanged.
+
+1. **"...committed them in our lab before any of the test's data was downloaded."** This holds only
+   for the 12 final-test coins. By our records, we committed the rules and the pass rule at 10:01
+   (UTC+7) and amendment v2-A1 at 11:06, and downloaded the 12 final-test coins' data later that day
+   (its data record was committed at 14:16). The coins used for development and selection had been
+   downloaded earlier, for our first Drift test. Read the sentence as: *we committed the rules and the
+   pass rule in our lab before any v2 result, and before the 12 final-test coins' data was
+   downloaded.*
+
+2. **"...simply holding the same coins with the same capital."** The benchmark in the pass rule is
+   not buy-and-hold. It keeps a constant USDT value in each coin, equal to the strategy's own average
+   capital in that coin, and trades back to that value at every 4-hour close. For the pass rule it
+   pays costs on its first entry and last exit only, not on the rebalancing trades. Rebalancing like
+   this gains or loses on its own, so it is a different baseline from buying once and holding. Read
+   the question as: *can a long-only trend rule, after costs, earn more per unit of drawdown than
+   that constant exposure?*
